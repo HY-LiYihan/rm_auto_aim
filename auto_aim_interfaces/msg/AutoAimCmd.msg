@@ -1,0 +1,9 @@
+std_msgs/Header header
+float64 pitch
+float64 yaw
+bool detected
+bool tracking
+bool fire
+float64 distance
+int32 proj_x
+int32 proj_y
