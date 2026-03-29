@@ -34,6 +34,10 @@ Tracker::Tracker(double max_match_distance, double max_match_yaw_diff)
       max_match_distance_(max_match_distance),
       max_match_yaw_diff_(max_match_yaw_diff) {}
 
+void Tracker::setMaxMatchDistance(double max_match_distance) {
+  max_match_distance_ = max_match_distance;
+}
+
 /**
  * @brief Initialize the tracker with the first received armors message.
  * Selects the armor closest to the image center as the target.
@@ -107,7 +111,8 @@ void Tracker::update(const Armors::SharedPtr &armors_msg) {
           // Update the best candidate.
           min_position_diff = position_diff;
           // Calculate yaw difference. Note: state(6) is Yaw.
-          yaw_diff = abs(orientationToYaw(armor.pose.orientation) - ekf_prediction(6));
+          yaw_diff = std::abs(angles::shortest_angular_distance(
+              ekf_prediction(6), orientationToYaw(armor.pose.orientation)));
           tracked_armor = armor;
         }
       }

@@ -5,6 +5,7 @@
 
 // ROS
 #include <message_filters/subscriber.h>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/create_timer_ros.h>
 #include <tf2_ros/message_filter.h>
@@ -35,11 +36,16 @@ public:
 
 private:
   void armorsCallback(const auto_aim_interfaces::msg::Armors::SharedPtr armors_ptr);
+  rcl_interfaces::msg::SetParametersResult onSetParameters(
+      const std::vector<rclcpp::Parameter> &params);
 
   void publishMarkers(const auto_aim_interfaces::msg::Target & target_msg);
 
   // Maximum allowable armor distance in the XOY plane
   double max_armor_distance_;
+  // Valid Z range of armor observations in target_frame
+  double min_armor_z_;
+  double max_armor_z_;
 
   // The time when the last message was received
   rclcpp::Time last_time_;
@@ -49,7 +55,10 @@ private:
   double s2qxyz_, s2qyaw_, s2qr_;
   double r_xyz_factor, r_yaw;
   double lost_time_thres_;
+  double max_match_distance_;
   std::unique_ptr<Tracker> tracker_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+      param_cb_handle_;
 
   // Reset tracker service
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_tracker_srv_;

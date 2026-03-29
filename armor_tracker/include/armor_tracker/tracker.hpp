@@ -35,6 +35,7 @@ public:
   void init(const Armors::SharedPtr & armors_msg);
 
   void update(const Armors::SharedPtr & armors_msg);
+  void setMaxMatchDistance(double max_match_distance);
 
   ExtendedKalmanFilter ekf;
 

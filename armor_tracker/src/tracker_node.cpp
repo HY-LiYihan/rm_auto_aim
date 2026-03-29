@@ -5,6 +5,8 @@
 #include "armor_tracker/tracker_node.hpp"
 
 // STD
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <vector>
 
@@ -23,18 +25,30 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions &options)
   // --- Parameters Declaration ---
   // Maximum allowable armor distance in the XOY plane (filter out outliers).
   max_armor_distance_ = this->declare_parameter("max_armor_distance", 10.0);
+  min_armor_z_ = this->declare_parameter("min_armor_z", -1.2);
+  max_armor_z_ = this->declare_parameter("max_armor_z", 1.2);
+  if (min_armor_z_ > max_armor_z_) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "min_armor_z (%.3f) > max_armor_z (%.3f), swapping them.",
+        min_armor_z_, max_armor_z_);
+    std::swap(min_armor_z_, max_armor_z_);
+  }
 
   // Tracker Parameters
-  double max_match_distance =
+  max_match_distance_ =
       this->declare_parameter("tracker.max_match_distance", 0.15);
   double max_match_yaw_diff =
       this->declare_parameter("tracker.max_match_yaw_diff", 1.0);
   
   // Initialize the Tracker core logic class
   tracker_ =
-      std::make_unique<Tracker>(max_match_distance, max_match_yaw_diff);
+      std::make_unique<Tracker>(max_match_distance_, max_match_yaw_diff);
   tracker_->tracking_thres = this->declare_parameter("tracker.tracking_thres", 5);
   lost_time_thres_ = this->declare_parameter("tracker.lost_time_thres", 0.3);
+  param_cb_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&ArmorTrackerNode::onSetParameters, this,
+                std::placeholders::_1));
 
   // --- EKF (Extended Kalman Filter) Configuration ---
   // State Vector (9 dims): [xc, v_xc, yc, v_yc, za, v_za, yaw, v_yaw, r]
@@ -235,7 +249,8 @@ void ArmorTrackerNode::armorsCallback(
       std::remove_if(
           armors_msg->armors.begin(), armors_msg->armors.end(),
           [this](const auto_aim_interfaces::msg::Armor &armor) {
-            return abs(armor.pose.position.z) > 1.2 ||
+            return armor.pose.position.z < min_armor_z_ ||
+                   armor.pose.position.z > max_armor_z_ ||
                    Eigen::Vector2d(armor.pose.position.x, armor.pose.position.y)
                            .norm() > max_armor_distance_;
           }),
@@ -254,8 +269,17 @@ void ArmorTrackerNode::armorsCallback(
     target_msg.tracking = false;
   } else {
     // Calculate dt (time interval) for Kalman Filter
-    dt_ = (time - last_time_).seconds();
-    tracker_->lost_thres = static_cast<int>(lost_time_thres_ / dt_);
+    double dt_raw = (time - last_time_).seconds();
+    constexpr double kMinDt = 1e-3;
+    if (!std::isfinite(dt_raw) || dt_raw <= 0.0) {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Invalid dt (%.6f). Falling back to %.6f.", dt_raw, kMinDt);
+      dt_ = kMinDt;
+    } else {
+      dt_ = std::max(dt_raw, kMinDt);
+    }
+    tracker_->lost_thres = std::max(1, static_cast<int>(lost_time_thres_ / dt_));
     
     // Core Update Logic
     tracker_->update(armors_msg);
@@ -384,6 +408,55 @@ void ArmorTrackerNode::publishMarkers(
   marker_array.markers.emplace_back(linear_v_marker_);
   marker_array.markers.emplace_back(angular_v_marker_);
   marker_pub_->publish(marker_array);
+}
+
+rcl_interfaces::msg::SetParametersResult ArmorTrackerNode::onSetParameters(
+    const std::vector<rclcpp::Parameter> &params) {
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  double new_max_armor_distance = max_armor_distance_;
+  double new_min_armor_z = min_armor_z_;
+  double new_max_armor_z = max_armor_z_;
+  double new_max_match_distance = max_match_distance_;
+
+  for (const auto &param : params) {
+    if (param.get_name() == "max_armor_distance") {
+      const double value = param.as_double();
+      if (value <= 0.0) {
+        result.successful = false;
+        result.reason = "max_armor_distance must be > 0.0";
+        return result;
+      }
+      new_max_armor_distance = value;
+    } else if (param.get_name() == "min_armor_z") {
+      new_min_armor_z = param.as_double();
+    } else if (param.get_name() == "max_armor_z") {
+      new_max_armor_z = param.as_double();
+    } else if (param.get_name() == "tracker.max_match_distance") {
+      const double value = param.as_double();
+      if (value <= 0.0) {
+        result.successful = false;
+        result.reason = "tracker.max_match_distance must be > 0.0";
+        return result;
+      }
+      new_max_match_distance = value;
+    }
+  }
+
+  if (new_min_armor_z > new_max_armor_z) {
+    result.successful = false;
+    result.reason = "min_armor_z must be <= max_armor_z";
+    return result;
+  }
+
+  max_armor_distance_ = new_max_armor_distance;
+  min_armor_z_ = new_min_armor_z;
+  max_armor_z_ = new_max_armor_z;
+  max_match_distance_ = new_max_match_distance;
+  tracker_->setMaxMatchDistance(max_match_distance_);
+
+  return result;
 }
 
 }  // namespace rm_auto_aim
