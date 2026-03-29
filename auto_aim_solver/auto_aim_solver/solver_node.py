@@ -3,6 +3,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, Vector3Stamped
 from sensor_msgs.msg import CameraInfo
 from auto_aim_interfaces.msg import AutoAimCmd, Target
@@ -52,12 +53,17 @@ class BallisticSolver(Node):
         self.declare_parameter('camera_frame', 'camera_optical_frame')
 
         self.update_params()
+        self.target_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.target_sub = self.create_subscription(
-            Target, self.target_topic, self.target_callback, 10)
+            Target, self.target_topic, self.target_callback, self.target_qos)
         self.speed_sub = self.create_subscription(
             GameStatus, self.speed_topic, self.game_status_callback, 10)
         self.camera_info_sub = self.create_subscription(

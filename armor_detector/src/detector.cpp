@@ -121,14 +121,52 @@ std::vector<Light> Detector::findLights(const cv::Mat &rbg_img,
         // thickness = -1 means fill the interior
         cv::drawContours(mask, roi_contours, -1, 255, -1);
 
-        // 5. Calculate average color inside the mask area
-        cv::Scalar average_color = cv::mean(roi, mask);
+        // 5. Classify color using HSV voting first, then RGB channel difference as fallback.
+        // This is more stable than comparing whole-ROI means, especially when the
+        // light bar contains white highlights or some background leakage.
+        cv::Mat hsv_roi;
+        cv::cvtColor(roi, hsv_roi, cv::COLOR_RGB2HSV);
 
-        // 6. Determine color based on channel intensity
-        // Assuming Input is RGB: Index 0 is Red, Index 2 is Blue.
-        // NOTE: Check your camera driver! If it's BGR, swap the indices.
-        light.color = average_color[0] > average_color[2] ? RED : BLUE;
-        
+        int red_votes = 0;
+        int blue_votes = 0;
+        double rb_score = 0.0;
+
+        for (int y = 0; y < roi.rows; ++y) {
+          const auto *mask_ptr = mask.ptr<uchar>(y);
+          const auto *rgb_ptr = roi.ptr<cv::Vec3b>(y);
+          const auto *hsv_ptr = hsv_roi.ptr<cv::Vec3b>(y);
+          for (int x = 0; x < roi.cols; ++x) {
+            if (mask_ptr[x] == 0) {
+              continue;
+            }
+
+            const auto &rgb = rgb_ptr[x];
+            const auto &hsv = hsv_ptr[x];
+            const int r = rgb[0];
+            const int b = rgb[2];
+            rb_score += static_cast<double>(r - b);
+
+            // Count only sufficiently saturated bright pixels for HSV voting.
+            if (hsv[1] < 60 || hsv[2] < 60) {
+              continue;
+            }
+
+            const int hue = hsv[0];
+            if (hue <= 15 || hue >= 165) {
+              red_votes++;
+            } else if (90 <= hue && hue <= 140) {
+              blue_votes++;
+            }
+          }
+        }
+
+        if (red_votes == 0 && blue_votes == 0) {
+          // Fallback: if hue is washed out by overexposure, fall back to RGB difference.
+          light.color = rb_score >= 0.0 ? RED : BLUE;
+        } else {
+          light.color = red_votes >= blue_votes ? RED : BLUE;
+        }
+
         // --- OPTIMIZATION END ---
 
         lights.emplace_back(light);
