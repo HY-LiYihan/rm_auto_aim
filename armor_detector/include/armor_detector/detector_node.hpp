@@ -8,8 +8,10 @@
 #include <image_transport/image_transport.hpp>
 #include <image_transport/publisher.hpp>
 #include <image_transport/subscriber_filter.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/publisher.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/time.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -42,6 +44,8 @@ private:
   void destroyDebugPublishers();
 
   void publishMarkers();
+  rcl_interfaces::msg::SetParametersResult onSetParameters(
+      const std::vector<rclcpp::Parameter> &params);
 
   // Armor Detector
   std::unique_ptr<Detector> detector_;
@@ -67,13 +71,28 @@ private:
 
   // Debug information
   bool debug_;
-  std::shared_ptr<rclcpp::ParameterEventHandler> debug_param_sub_;
-  std::shared_ptr<rclcpp::ParameterCallbackHandle> debug_cb_handle_;
+  int binary_thres_;
+  int detect_color_;
+  double classifier_threshold_;
+  double debug_publish_rate_;
+  rclcpp::Time last_debug_pub_time_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+      param_cb_handle_;
   rclcpp::Publisher<auto_aim_interfaces::msg::DebugLights>::SharedPtr lights_data_pub_;
   rclcpp::Publisher<auto_aim_interfaces::msg::DebugArmors>::SharedPtr armors_data_pub_;
   image_transport::Publisher binary_img_pub_;
   image_transport::Publisher number_img_pub_;
   image_transport::Publisher result_img_pub_;
+
+  std::string camera_info_topic_;
+  std::string image_topic_;
+  std::string armors_topic_;
+  std::string marker_topic_;
+  std::string debug_lights_topic_;
+  std::string debug_armors_topic_;
+  std::string debug_binary_img_topic_;
+  std::string debug_number_img_topic_;
+  std::string debug_result_img_topic_;
 };
 
 }  // namespace rm_auto_aim

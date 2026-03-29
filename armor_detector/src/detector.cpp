@@ -283,7 +283,8 @@ ArmorType Detector::isArmor(const Light &light_1, const Light &light_2) {
 
   // 3. Parallel Angle Check
   cv::Point2f diff = light_1.center - light_2.center;
-  float angle = std::abs(std::atan(diff.y / diff.x)) / CV_PI * 180;
+  float angle =
+      std::atan2(std::abs(diff.y), std::abs(diff.x)) / CV_PI * 180.0f;
   bool angle_ok = angle < a.max_angle;
 
   bool is_armor = light_ratio_ok && center_distance_ok && angle_ok;
