@@ -1,21 +1,32 @@
 /armor_detector:
   ros__parameters:
-    debug: true
+    debug: true  # 是否发布调试信息与调试图像
+    debug_publish_rate: 10.0  # debug图像与debug消息发布频率(Hz)，0表示每帧都发
 
-    detect_color: 0 #(0-Red, 1-Blue)
-    binary_thres: 150
-    classifier_threshold: 0.6
+    camera_info_topic: /camera_info  # 相机内参输入话题
+    image_topic: /image_raw  # 相机图像输入话题
+    armors_topic: /detector/armors  # 装甲识别结果输出话题
+    marker_topic: /detector/marker  # 可视化Marker输出话题
+    debug_lights_topic: /detector/debug_lights  # 灯条调试信息话题
+    debug_armors_topic: /detector/debug_armors  # 装甲板调试信息话题
+    debug_binary_img_topic: /detector/binary_img  # 二值图调试话题
+    debug_number_img_topic: /detector/number_img  # 数字ROI调试图话题
+    debug_result_img_topic: /detector/result_img  # 结果叠加调试图话题
 
-    ignore_classes: ["negative"]
+    detect_color: 0  # 识别敌方颜色：0=RED, 1=BLUE
+    binary_thres: 150  # 图像二值化阈值(0-255)
+    classifier_threshold: 0.6  # 数字分类置信度阈值(0-1)
+
+    ignore_classes: ["negative"]  # 分类结果忽略名单
     light:
-      min_ratio: 0.05
-      max_ratio: 0.4
-      max_angle: 40.0
+      min_ratio: 0.05  # 灯条最小宽高比(短边/长边)
+      max_ratio: 0.4  # 灯条最大宽高比(短边/长边)
+      max_angle: 40.0  # 灯条最大倾斜角(度)
 
     armor:
-      min_light_ratio: 0.6
-      min_small_center_distance: 0.8
-      max_small_center_distance: 3.2
-      min_large_center_distance: 3.2
-      max_large_center_distance: 5.5
-      max_angle: 35.0
+      min_light_ratio: 0.6  # 成对灯条最小长度比(短/长)
+      min_small_center_distance: 0.8  # 小装甲最小中心距(按灯条长度归一化)
+      max_small_center_distance: 3.2  # 小装甲最大中心距(按灯条长度归一化)
+      min_large_center_distance: 3.2  # 大装甲最小中心距(按灯条长度归一化)
+      max_large_center_distance: 5.5  # 大装甲最大中心距(按灯条长度归一化)
+      max_angle: 35.0  # 装甲板连线最大倾斜角(度)

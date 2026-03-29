@@ -34,6 +34,8 @@ private:
   cv::dnn::Net net_;
   std::vector<std::string> class_names_;
   std::vector<std::string> ignore_classes_;
+  bool model_ready_ = false;
+  bool model_error_logged_ = false;
 };
 }  // namespace rm_auto_aim
 

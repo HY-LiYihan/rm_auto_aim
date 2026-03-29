@@ -115,12 +115,11 @@ ArmorDetectorNode::ArmorDetectorNode(const rclcpp::NodeOptions &options)
               "for valid camera_info...");
           return;
         }
-        if (camera_info->d.size() < 5) {
+        if (camera_info->d.empty()) {
           RCLCPP_WARN_THROTTLE(
-              this->get_logger(), *this->get_clock(), 2000,
-              "Invalid camera distortion coefficients in camera_info "
-              "(size < 5). Waiting for valid camera_info...");
-          return;
+              this->get_logger(), *this->get_clock(), 5000,
+              "camera_info distortion coefficients are empty. PnP will use "
+              "zero distortion.");
         }
         if (camera_info->header.frame_id.empty()) {
           RCLCPP_WARN_THROTTLE(
@@ -388,13 +387,15 @@ void ArmorDetectorNode::destroyDebugPublishers() {
 
 void ArmorDetectorNode::publishMarkers() {
   using Marker = visualization_msgs::msg::Marker;
-  // If no armor detected, DELETE the marker. Otherwise ADD/MODIFY it.
-  armor_marker_.action =
-      armors_msg_.armors.empty() ? Marker::DELETE : Marker::ADD;
-
-  // Bug fix: Always push back markers even if deleting, so Rviz knows what ID to
-  // delete
-  marker_array_.markers.emplace_back(armor_marker_);
+  if (armors_msg_.armors.empty()) {
+    // Clear all existing markers from this topic to avoid stale text/armor
+    // artifacts in RViz.
+    marker_array_.markers.clear();
+    Marker delete_all_marker;
+    delete_all_marker.header = armors_msg_.header;
+    delete_all_marker.action = Marker::DELETEALL;
+    marker_array_.markers.emplace_back(delete_all_marker);
+  }
   marker_pub_->publish(marker_array_);
 }
 
@@ -403,18 +404,17 @@ rcl_interfaces::msg::SetParametersResult ArmorDetectorNode::onSetParameters(
   rcl_interfaces::msg::SetParametersResult result;
   result.successful = true;
 
+  bool new_debug = debug_;
+  int new_binary_thres = binary_thres_;
+  int new_detect_color = detect_color_;
+  double new_classifier_threshold = classifier_threshold_;
+  double new_debug_publish_rate = debug_publish_rate_;
+  Detector::LightParams new_l = detector_->l;
+  Detector::ArmorParams new_a = detector_->a;
+
   for (const auto &param : params) {
     if (param.get_name() == "debug") {
-      const bool new_debug = param.as_bool();
-      if (new_debug != debug_) {
-        debug_ = new_debug;
-        if (debug_) {
-          createDebugPublishers();
-          last_debug_pub_time_ = this->now();
-        } else {
-          destroyDebugPublishers();
-        }
-      }
+      new_debug = param.as_bool();
     } else if (param.get_name() == "binary_thres") {
       const int value = param.as_int();
       if (value < 0 || value > 255) {
@@ -422,8 +422,7 @@ rcl_interfaces::msg::SetParametersResult ArmorDetectorNode::onSetParameters(
         result.reason = "binary_thres must be in [0, 255]";
         return result;
       }
-      binary_thres_ = value;
-      detector_->binary_thres = value;
+      new_binary_thres = value;
     } else if (param.get_name() == "detect_color") {
       const int value = param.as_int();
       if (value != RED && value != BLUE) {
@@ -431,8 +430,7 @@ rcl_interfaces::msg::SetParametersResult ArmorDetectorNode::onSetParameters(
         result.reason = "detect_color must be 0 (RED) or 1 (BLUE)";
         return result;
       }
-      detect_color_ = value;
-      detector_->detect_color = value;
+      new_detect_color = value;
     } else if (param.get_name() == "classifier_threshold") {
       const double value = param.as_double();
       if (value < 0.0 || value > 1.0) {
@@ -440,8 +438,7 @@ rcl_interfaces::msg::SetParametersResult ArmorDetectorNode::onSetParameters(
         result.reason = "classifier_threshold must be in [0.0, 1.0]";
         return result;
       }
-      classifier_threshold_ = value;
-      detector_->classifier->threshold = value;
+      new_classifier_threshold = value;
     } else if (param.get_name() == "debug_publish_rate") {
       const double value = param.as_double();
       if (value < 0.0) {
@@ -449,9 +446,121 @@ rcl_interfaces::msg::SetParametersResult ArmorDetectorNode::onSetParameters(
         result.reason = "debug_publish_rate must be >= 0.0";
         return result;
       }
-      debug_publish_rate_ = value;
+      new_debug_publish_rate = value;
+    } else if (param.get_name() == "light.min_ratio") {
+      const double value = param.as_double();
+      if (value < 0.0) {
+        result.successful = false;
+        result.reason = "light.min_ratio must be >= 0.0";
+        return result;
+      }
+      new_l.min_ratio = value;
+    } else if (param.get_name() == "light.max_ratio") {
+      const double value = param.as_double();
+      if (value <= 0.0) {
+        result.successful = false;
+        result.reason = "light.max_ratio must be > 0.0";
+        return result;
+      }
+      new_l.max_ratio = value;
+    } else if (param.get_name() == "light.max_angle") {
+      const double value = param.as_double();
+      if (value < 0.0) {
+        result.successful = false;
+        result.reason = "light.max_angle must be >= 0.0";
+        return result;
+      }
+      new_l.max_angle = value;
+    } else if (param.get_name() == "armor.min_light_ratio") {
+      const double value = param.as_double();
+      if (value < 0.0) {
+        result.successful = false;
+        result.reason = "armor.min_light_ratio must be >= 0.0";
+        return result;
+      }
+      new_a.min_light_ratio = value;
+    } else if (param.get_name() == "armor.min_small_center_distance") {
+      const double value = param.as_double();
+      if (value < 0.0) {
+        result.successful = false;
+        result.reason = "armor.min_small_center_distance must be >= 0.0";
+        return result;
+      }
+      new_a.min_small_center_distance = value;
+    } else if (param.get_name() == "armor.max_small_center_distance") {
+      const double value = param.as_double();
+      if (value <= 0.0) {
+        result.successful = false;
+        result.reason = "armor.max_small_center_distance must be > 0.0";
+        return result;
+      }
+      new_a.max_small_center_distance = value;
+    } else if (param.get_name() == "armor.min_large_center_distance") {
+      const double value = param.as_double();
+      if (value < 0.0) {
+        result.successful = false;
+        result.reason = "armor.min_large_center_distance must be >= 0.0";
+        return result;
+      }
+      new_a.min_large_center_distance = value;
+    } else if (param.get_name() == "armor.max_large_center_distance") {
+      const double value = param.as_double();
+      if (value <= 0.0) {
+        result.successful = false;
+        result.reason = "armor.max_large_center_distance must be > 0.0";
+        return result;
+      }
+      new_a.max_large_center_distance = value;
+    } else if (param.get_name() == "armor.max_angle") {
+      const double value = param.as_double();
+      if (value < 0.0) {
+        result.successful = false;
+        result.reason = "armor.max_angle must be >= 0.0";
+        return result;
+      }
+      new_a.max_angle = value;
     }
   }
+
+  if (new_l.min_ratio >= new_l.max_ratio) {
+    result.successful = false;
+    result.reason = "light.min_ratio must be < light.max_ratio";
+    return result;
+  }
+  if (new_a.min_small_center_distance >= new_a.max_small_center_distance) {
+    result.successful = false;
+    result.reason =
+        "armor.min_small_center_distance must be < "
+        "armor.max_small_center_distance";
+    return result;
+  }
+  if (new_a.min_large_center_distance >= new_a.max_large_center_distance) {
+    result.successful = false;
+    result.reason =
+        "armor.min_large_center_distance must be < "
+        "armor.max_large_center_distance";
+    return result;
+  }
+
+  if (new_debug != debug_) {
+    debug_ = new_debug;
+    if (debug_) {
+      createDebugPublishers();
+      last_debug_pub_time_ = this->now();
+    } else {
+      destroyDebugPublishers();
+    }
+  }
+
+  binary_thres_ = new_binary_thres;
+  detect_color_ = new_detect_color;
+  classifier_threshold_ = new_classifier_threshold;
+  debug_publish_rate_ = new_debug_publish_rate;
+  detector_->binary_thres = new_binary_thres;
+  detector_->detect_color = new_detect_color;
+  detector_->classifier->threshold = new_classifier_threshold;
+  detector_->l = new_l;
+  detector_->a = new_a;
 
   return result;
 }

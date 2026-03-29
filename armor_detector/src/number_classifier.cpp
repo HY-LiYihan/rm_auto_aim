@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <string>
 #include <vector>
@@ -40,14 +41,33 @@ NumberClassifier::NumberClassifier(
     const double thre, const std::vector<std::string> &ignore_classes)
     : threshold(thre), ignore_classes_(ignore_classes) {
   // Load the neural network model using OpenCV DNN module.
-  net_ = cv::dnn::readNetFromONNX(model_path);
+  try {
+    net_ = cv::dnn::readNetFromONNX(model_path);
+  } catch (const cv::Exception &e) {
+    std::cerr << "[NumberClassifier] Failed to load ONNX model: " << model_path
+              << ", error: " << e.what() << std::endl;
+  }
+  if (net_.empty()) {
+    std::cerr << "[NumberClassifier] ONNX model is empty or unavailable: "
+              << model_path << std::endl;
+  }
 
   // Load class labels from the text file.
   std::ifstream label_file(label_path);
+  if (!label_file.is_open()) {
+    std::cerr << "[NumberClassifier] Failed to open label file: " << label_path
+              << std::endl;
+  }
   std::string line;
   while (std::getline(label_file, line)) {
     class_names_.push_back(line);
   }
+  if (class_names_.empty()) {
+    std::cerr << "[NumberClassifier] Label file is empty: " << label_path
+              << std::endl;
+  }
+
+  model_ready_ = !net_.empty() && !class_names_.empty();
 }
 
 /**
@@ -122,6 +142,17 @@ void NumberClassifier::extractNumbers(const cv::Mat &src,
  * @param armors The vector of armors to classify.
  */
 void NumberClassifier::classify(std::vector<Armor> &armors) {
+  if (!model_ready_) {
+    if (!model_error_logged_) {
+      std::cerr << "[NumberClassifier] Model or labels are not ready. "
+                   "Skipping classification."
+                << std::endl;
+      model_error_logged_ = true;
+    }
+    armors.clear();
+    return;
+  }
+
   for (auto &armor : armors) {
     cv::Mat image = armor.number_img.clone();
 
@@ -136,6 +167,12 @@ void NumberClassifier::classify(std::vector<Armor> &armors) {
     // 3. Inference
     net_.setInput(blob);
     cv::Mat outputs = net_.forward();
+    if (outputs.empty()) {
+      armor.confidence = 0.0;
+      armor.number = "negative";
+      armor.classfication_result = "invalid_output";
+      continue;
+    }
 
     // 4. Softmax calculation (Convert logits to probabilities).
     // Find max value to prevent overflow during exp().
@@ -152,6 +189,12 @@ void NumberClassifier::classify(std::vector<Armor> &armors) {
     minMaxLoc(softmax_prob.reshape(1, 1), nullptr, &confidence, nullptr,
               &class_id_point);
     int label_id = class_id_point.x;
+    if (label_id < 0 || label_id >= static_cast<int>(class_names_.size())) {
+      armor.confidence = 0.0;
+      armor.number = "negative";
+      armor.classfication_result = "invalid_label";
+      continue;
+    }
 
     armor.confidence = confidence;
     armor.number = class_names_[label_id];
