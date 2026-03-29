@@ -1,4 +1,3 @@
-import math
 import numpy as np
 
 import rclpy
@@ -12,6 +11,15 @@ from std_msgs.msg import Bool, Float32
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+
+from .ballistics import BallisticCalculator, BallisticParams
+from .delay import DelayConfig, compute_data_age_s, compute_delta_t_s
+from .targeting import (
+    predict_target_state,
+    reconstruct_armor_points,
+    select_target_point,
+    target_state_from_msg,
+)
 
 
 class BallisticSolver(Node):
@@ -41,10 +49,11 @@ class BallisticSolver(Node):
         self.declare_parameter('solver.max_iterations', 18)
         self.declare_parameter('solver.max_time', 5.0)
         self.declare_parameter('solver.ground_z', 0.0)
+        self.declare_parameter('timing.pipeline_delay', 0.02)
+        self.declare_parameter('timing.control_delay', 0.015)
         self.declare_parameter('auto_aim_topic', '/auto_aim')
         self.declare_parameter('solution_topic', '/auto_aim/gimbal_cmd')
         self.declare_parameter('aim_point_topic', '/auto_aim/aim_point')
-        self.declare_parameter('reprojected_topic', '/auto_aim/reprojected_target')
         self.declare_parameter('detect_topic', '/auto_aim/detect')
         self.declare_parameter('track_topic', '/auto_aim/track')
         self.declare_parameter('fire_topic', '/auto_aim/fire')
@@ -71,7 +80,6 @@ class BallisticSolver(Node):
 
         self.solution_pub = self.create_publisher(Vector3Stamped, self.solution_topic, 10)
         self.aim_point_pub = self.create_publisher(PointStamped, self.aim_point_topic, 10)
-        self.reprojected_pub = self.create_publisher(PointStamped, self.reprojected_topic, 10)
         self.auto_aim_pub = self.create_publisher(AutoAimCmd, self.auto_aim_topic, 10)
         self.detect_pub = self.create_publisher(Bool, self.detect_topic, 10)
         self.track_pub = self.create_publisher(Bool, self.track_topic, 10)
@@ -80,9 +88,9 @@ class BallisticSolver(Node):
 
         self.latest_target = None
         self.latest_target_time = None
+        self.latest_target_state = None
         self.latest_live_speed = None
         self.latest_live_speed_time = None
-        self.latest_target_points = []
         self.camera_frame = self.get_parameter('camera_frame').value
         self.fx = None
         self.fy = None
@@ -114,10 +122,11 @@ class BallisticSolver(Node):
         self.max_iterations = self.get_parameter('solver.max_iterations').value
         self.solver_max_time = self.get_parameter('solver.max_time').value
         self.ground_z = self.get_parameter('solver.ground_z').value
+        self.pipeline_delay_s = self.get_parameter('timing.pipeline_delay').value
+        self.control_delay_s = self.get_parameter('timing.control_delay').value
         self.auto_aim_topic = self.get_parameter('auto_aim_topic').value
         self.solution_topic = self.get_parameter('solution_topic').value
         self.aim_point_topic = self.get_parameter('aim_point_topic').value
-        self.reprojected_topic = self.get_parameter('reprojected_topic').value
         self.detect_topic = self.get_parameter('detect_topic').value
         self.track_topic = self.get_parameter('track_topic').value
         self.fire_topic = self.get_parameter('fire_topic').value
@@ -128,14 +137,30 @@ class BallisticSolver(Node):
             self.camera_frame = configured_camera_frame
 
         self.dt = 1.0 / max(self.update_frequency, 1.0)
-        self.area = math.pi * (self.radius ** 2)
+
+        params = BallisticParams(
+            mass=self.mass,
+            radius=self.radius,
+            drag_coeff=self.drag_coeff,
+            air_density=self.rho,
+            min_pitch=self.min_pitch,
+            max_pitch=self.max_pitch,
+            pitch_samples=int(self.pitch_samples),
+            max_iterations=int(self.max_iterations),
+            solver_max_time=self.solver_max_time,
+            ground_z=self.ground_z,
+            dt=self.dt,
+        )
+        self.ballistic_calculator = BallisticCalculator(params, self.get_current_muzzle_speed)
+        self.delay_config = DelayConfig(
+            pipeline_delay_s=self.pipeline_delay_s,
+            control_delay_s=self.control_delay_s,
+        )
 
     def target_callback(self, msg):
         self.latest_target = msg
         self.latest_target_time = self.get_clock().now()
-        self.latest_target_points = []
-        if msg.tracking:
-            self.latest_target_points = self.reconstruct_armor_points(msg)
+        self.latest_target_state = target_state_from_msg(msg)
 
     def game_status_callback(self, msg):
         if msg.initial_speed >= self.min_live_speed:
@@ -173,25 +198,6 @@ class BallisticSolver(Node):
             return self.v0
         return self.latest_live_speed
 
-    def reconstruct_armor_points(self, target_msg):
-        points = []
-        base_yaw = target_msg.yaw
-        armor_num = max(1, target_msg.armors_num)
-        is_current_pair = True
-        for i in range(armor_num):
-            tmp_yaw = base_yaw + i * (2 * math.pi / armor_num)
-            if armor_num == 4:
-                radius = target_msg.radius_1 if is_current_pair else target_msg.radius_2
-                z = target_msg.position.z if is_current_pair else target_msg.position.z + target_msg.dz
-                is_current_pair = not is_current_pair
-            else:
-                radius = target_msg.radius_1
-                z = target_msg.position.z
-            x = target_msg.position.x - radius * math.cos(tmp_yaw)
-            y = target_msg.position.y - radius * math.sin(tmp_yaw)
-            points.append(np.array([x, y, z], dtype=float))
-        return points
-
     def get_launch_pose(self):
         try:
             t = self.tf_buffer.lookup_transform(
@@ -199,7 +205,7 @@ class BallisticSolver(Node):
             pos = np.array([
                 t.transform.translation.x,
                 t.transform.translation.y,
-                t.transform.translation.z
+                t.transform.translation.z,
             ], dtype=float)
             x, y, z, w = (
                 t.transform.rotation.x,
@@ -222,7 +228,7 @@ class BallisticSolver(Node):
             trans = np.array([
                 t.transform.translation.x,
                 t.transform.translation.y,
-                t.transform.translation.z
+                t.transform.translation.z,
             ], dtype=float)
             x, y, z, w = (
                 t.transform.rotation.x,
@@ -238,9 +244,6 @@ class BallisticSolver(Node):
             return rot, trans
         except TransformException:
             return None, None
-
-    def world_to_launch(self, point_world, launch_pos, launch_rot):
-        return launch_rot.T @ (point_world - launch_pos)
 
     def project_point_to_image(self, point_world):
         if self.fx is None or self.fy is None or self.cx is None or self.cy is None:
@@ -261,123 +264,6 @@ class BallisticSolver(Node):
         v = self.fy * float(point_camera[1]) / z + self.cy
         return u, v, z
 
-    def direction_from_angles(self, yaw, pitch, launch_rot):
-        local_dir = np.array([
-            math.cos(pitch) * math.cos(yaw),
-            math.cos(pitch) * math.sin(yaw),
-            math.sin(pitch)
-        ], dtype=float)
-        world_dir = launch_rot @ local_dir
-        return world_dir / np.linalg.norm(world_dir)
-
-    def calculate_acceleration(self, velocity):
-        v_mag = np.linalg.norm(velocity)
-        if v_mag > 0.001:
-            drag_force = 0.5 * self.rho * (v_mag ** 2) * self.drag_coeff * self.area
-            drag_vec = -(velocity / v_mag) * drag_force
-        else:
-            drag_vec = np.zeros(3)
-        gravity_vec = np.array([0.0, 0.0, -self.mass * 9.81])
-        return (drag_vec + gravity_vec) / self.mass
-
-    def evaluate_pitch(self, pitch, yaw, launch_pos, launch_rot, target_world, target_range):
-        muzzle_speed = self.get_current_muzzle_speed()
-        vel = self.direction_from_angles(yaw, pitch, launch_rot) * muzzle_speed
-        pos = launch_pos.copy()
-        prev_pos = pos.copy()
-        prev_range = 0.0
-        flight_time = 0.0
-        aim_dir_xy = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
-        target_local = self.world_to_launch(target_world, launch_pos, launch_rot)
-
-        max_steps = max(1, int(self.solver_max_time / self.dt))
-        for _ in range(max_steps):
-            prev_pos = pos.copy()
-            acc = self.calculate_acceleration(vel)
-            vel += acc * self.dt
-            pos += vel * self.dt
-            flight_time += self.dt
-
-            local_pos = self.world_to_launch(pos, launch_pos, launch_rot)
-            horizontal_range = float(np.dot(local_pos[:2], aim_dir_xy))
-
-            if pos[2] <= self.ground_z and horizontal_range < target_range:
-                return None
-            if horizontal_range >= target_range:
-                denom = horizontal_range - prev_range
-                ratio = 0.0 if abs(denom) < 1e-6 else (target_range - prev_range) / denom
-                ratio = min(max(ratio, 0.0), 1.0)
-                hit_pos = prev_pos + ratio * (pos - prev_pos)
-                hit_local = self.world_to_launch(hit_pos, launch_pos, launch_rot)
-                z_error = float(hit_local[2] - target_local[2])
-                miss_distance = float(np.linalg.norm(hit_pos - target_world))
-                return {
-                    'pitch': pitch,
-                    'yaw': yaw,
-                    'flight_time': flight_time - self.dt + ratio * self.dt,
-                    'z_error': z_error,
-                    'miss_distance': miss_distance,
-                    'hit_pos': hit_pos,
-                }
-            prev_range = horizontal_range
-        return None
-
-    def solve_ballistic_arc(self, target_world, launch_pos, launch_rot):
-        target_local = self.world_to_launch(target_world, launch_pos, launch_rot)
-        target_range = float(np.linalg.norm(target_local[:2]))
-        if target_range < 1e-4:
-            return None
-
-        yaw = math.atan2(target_local[1], target_local[0])
-        sample_pitches = np.linspace(self.min_pitch, self.max_pitch, int(self.pitch_samples))
-        valid_results = []
-        for pitch in sample_pitches:
-            result = self.evaluate_pitch(float(pitch), yaw, launch_pos, launch_rot, target_world, target_range)
-            if result is not None:
-                valid_results.append(result)
-        if not valid_results:
-            return None
-
-        best = min(valid_results, key=lambda item: abs(item['z_error']))
-        sign_change = None
-        for left, right in zip(valid_results[:-1], valid_results[1:]):
-            if left['z_error'] == 0.0:
-                sign_change = (left, left)
-                break
-            if left['z_error'] * right['z_error'] < 0.0:
-                sign_change = (left, right)
-                break
-        if sign_change is None:
-            return best
-
-        low_pitch = sign_change[0]['pitch']
-        high_pitch = sign_change[1]['pitch']
-        low_error = sign_change[0]['z_error']
-        refined = best
-        for _ in range(int(self.max_iterations)):
-            mid_pitch = 0.5 * (low_pitch + high_pitch)
-            mid_result = self.evaluate_pitch(mid_pitch, yaw, launch_pos, launch_rot, target_world, target_range)
-            if mid_result is None:
-                break
-            refined = mid_result
-            if abs(mid_result['z_error']) < abs(best['z_error']):
-                best = mid_result
-            if abs(mid_result['z_error']) < 1e-3:
-                return mid_result
-            if low_error * mid_result['z_error'] <= 0.0:
-                high_pitch = mid_pitch
-            else:
-                low_pitch = mid_pitch
-                low_error = mid_result['z_error']
-        return best if abs(best['z_error']) <= abs(refined['z_error']) else refined
-
-    def select_target_point(self, points, launch_pos):
-        if not points:
-            return None
-        if launch_pos is None:
-            return points[0]
-        return min(points, key=lambda p: np.linalg.norm(p - launch_pos))
-
     def solve_once(self):
         has_target = self.target_is_fresh()
         is_tracking = has_target and self.latest_target is not None and bool(self.latest_target.tracking)
@@ -395,18 +281,35 @@ class BallisticSolver(Node):
         self.track_pub.publish(Bool(data=is_tracking))
         self.fire_pub.publish(Bool(data=False))
 
-        if not has_target or not is_tracking:
+        if not has_target or not is_tracking or self.latest_target_state is None:
             self.auto_aim_pub.publish(auto_aim_msg)
             return
+
         launch_pos, launch_rot = self.get_launch_pose()
         if launch_pos is None:
             self.auto_aim_pub.publish(auto_aim_msg)
             return
-        target_point = self.select_target_point(self.latest_target_points, launch_pos)
+
+        current_candidates = reconstruct_armor_points(self.latest_target_state)
+        coarse_target = select_target_point(current_candidates, launch_pos)
+        if coarse_target is None:
+            self.auto_aim_pub.publish(auto_aim_msg)
+            return
+
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        sample_sec = self.latest_target_time.nanoseconds / 1e9
+        data_age_s = compute_data_age_s(now_sec, sample_sec)
+        flight_guess_s = self.ballistic_calculator.estimate_flight_time_s(coarse_target, launch_pos)
+        delta_t = compute_delta_t_s(data_age_s, flight_guess_s, self.delay_config)
+
+        predicted_state = predict_target_state(self.latest_target_state, delta_t)
+        predicted_candidates = reconstruct_armor_points(predicted_state)
+        target_point = select_target_point(predicted_candidates, launch_pos)
         if target_point is None:
             self.auto_aim_pub.publish(auto_aim_msg)
             return
-        solution = self.solve_ballistic_arc(target_point, launch_pos, launch_rot)
+
+        solution = self.ballistic_calculator.solve_ballistic_arc(target_point, launch_pos, launch_rot)
         if solution is None:
             self.auto_aim_pub.publish(auto_aim_msg)
             return
@@ -423,12 +326,6 @@ class BallisticSolver(Node):
 
         reprojection = self.project_point_to_image(target_point)
         if reprojection is not None:
-            reprojected_msg = PointStamped()
-            reprojected_msg.header = aim_msg.header
-            reprojected_msg.point.x = float(reprojection[0])
-            reprojected_msg.point.y = float(reprojection[1])
-            reprojected_msg.point.z = float(reprojection[2])
-            self.reprojected_pub.publish(reprojected_msg)
             auto_aim_msg.proj_x = int(round(reprojection[0]))
             auto_aim_msg.proj_y = int(round(reprojection[1]))
 
