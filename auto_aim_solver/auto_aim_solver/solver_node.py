@@ -1,4 +1,5 @@
 import numpy as np
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -35,6 +36,7 @@ class BallisticSolver(Node):
         self.declare_parameter('initial_speed', 28.0)
         self.declare_parameter('launch_frame', 'launcher_link')
         self.declare_parameter('map_frame', 'odom')
+        self.declare_parameter('command_frame', '')
         self.declare_parameter('update_frequency', 30.0)
         self.declare_parameter('target_topic', '/tracker/target')
         self.declare_parameter('target_timeout', 0.2)
@@ -108,6 +110,9 @@ class BallisticSolver(Node):
         self.v0 = self.get_parameter('initial_speed').value
         self.launch_frame = self.get_parameter('launch_frame').value
         self.map_frame = self.get_parameter('map_frame').value
+        self.command_frame = self.get_parameter('command_frame').value
+        if not self.command_frame:
+            self.command_frame = self.launch_frame
         self.update_frequency = self.get_parameter('update_frequency').value
         self.target_topic = self.get_parameter('target_topic').value
         self.target_timeout = self.get_parameter('target_timeout').value
@@ -222,6 +227,10 @@ class BallisticSolver(Node):
         except TransformException:
             return None, None
 
+    def get_command_rotation(self):
+        rot, _ = self.get_frame_transform(self.map_frame, self.command_frame)
+        return rot
+
     def get_frame_transform(self, target_frame, source_frame):
         try:
             t = self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time())
@@ -264,12 +273,26 @@ class BallisticSolver(Node):
         v = self.fy * float(point_camera[1]) / z + self.cy
         return u, v, z
 
+    @staticmethod
+    def solve_direct_aim(target_world, launch_pos, command_rot):
+        target_local = command_rot.T @ (target_world - launch_pos)
+        horizontal = float(np.linalg.norm(target_local[:2]))
+        if horizontal < 1e-6 and abs(float(target_local[2])) < 1e-6:
+            return None
+        yaw = math.atan2(float(target_local[1]), float(target_local[0]))
+        pitch = math.atan2(float(target_local[2]), horizontal)
+        return {
+            'yaw': yaw,
+            'pitch': pitch,
+            'flight_time': 0.0,
+        }
+
     def solve_once(self):
         has_target = self.target_is_fresh()
         is_tracking = has_target and self.latest_target is not None and bool(self.latest_target.tracking)
         auto_aim_msg = AutoAimCmd()
         auto_aim_msg.header.stamp = self.get_clock().now().to_msg()
-        auto_aim_msg.header.frame_id = self.map_frame
+        auto_aim_msg.header.frame_id = self.command_frame
         auto_aim_msg.detected = bool(has_target)
         auto_aim_msg.tracking = bool(is_tracking)
         auto_aim_msg.fire = False
@@ -282,36 +305,23 @@ class BallisticSolver(Node):
         self.fire_pub.publish(Bool(data=False))
 
         if not has_target or not is_tracking or self.latest_target_state is None:
-            self.auto_aim_pub.publish(auto_aim_msg)
             return
 
         launch_pos, launch_rot = self.get_launch_pose()
         if launch_pos is None:
-            self.auto_aim_pub.publish(auto_aim_msg)
+            return
+
+        command_rot = self.get_command_rotation()
+        if command_rot is None:
             return
 
         current_candidates = reconstruct_armor_points(self.latest_target_state)
-        coarse_target = select_target_point(current_candidates, launch_pos)
-        if coarse_target is None:
-            self.auto_aim_pub.publish(auto_aim_msg)
+        if not current_candidates:
             return
 
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        sample_sec = self.latest_target_time.nanoseconds / 1e9
-        data_age_s = compute_data_age_s(now_sec, sample_sec)
-        flight_guess_s = self.ballistic_calculator.estimate_flight_time_s(coarse_target, launch_pos)
-        delta_t = compute_delta_t_s(data_age_s, flight_guess_s, self.delay_config)
-
-        predicted_state = predict_target_state(self.latest_target_state, delta_t)
-        predicted_candidates = reconstruct_armor_points(predicted_state)
-        target_point = select_target_point(predicted_candidates, launch_pos)
-        if target_point is None:
-            self.auto_aim_pub.publish(auto_aim_msg)
-            return
-
-        solution = self.ballistic_calculator.solve_ballistic_arc(target_point, launch_pos, launch_rot)
+        target_point = current_candidates[0]
+        solution = self.solve_direct_aim(target_point, launch_pos, command_rot)
         if solution is None:
-            self.auto_aim_pub.publish(auto_aim_msg)
             return
 
         target_distance = float(np.linalg.norm(target_point - launch_pos))
@@ -330,7 +340,8 @@ class BallisticSolver(Node):
             auto_aim_msg.proj_y = int(round(reprojection[1]))
 
         sol_msg = Vector3Stamped()
-        sol_msg.header = aim_msg.header
+        sol_msg.header.stamp = aim_msg.header.stamp
+        sol_msg.header.frame_id = self.command_frame
         sol_msg.vector.x = float(solution['yaw'])
         sol_msg.vector.y = float(solution['pitch'])
         sol_msg.vector.z = float(solution['flight_time'])
