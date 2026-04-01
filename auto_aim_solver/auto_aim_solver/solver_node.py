@@ -61,7 +61,7 @@ class BallisticSolver(Node):
         self.declare_parameter('fire_topic', '/auto_aim/fire')
         self.declare_parameter('distance_topic', '/auto_aim/distance')
         self.declare_parameter('camera_info_topic', '/camera_info')
-        self.declare_parameter('camera_frame', 'camera_optical_frame')
+        self.declare_parameter('camera_frame', 'camera_link')
 
         self.update_params()
         self.target_qos = QoSProfile(
