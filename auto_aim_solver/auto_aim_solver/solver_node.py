@@ -6,7 +6,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, Vector3Stamped
 from sensor_msgs.msg import CameraInfo
-from auto_aim_interfaces.msg import AutoAimCmd, Target
+from auto_aim_interfaces.msg import Armors, AutoAimCmd, Target
 from venom_serial_driver.msg import GameStatus
 from std_msgs.msg import Bool, Float32
 from tf2_ros import TransformException
@@ -37,9 +37,14 @@ class BallisticSolver(Node):
         self.declare_parameter('launch_frame', 'launcher_link')
         self.declare_parameter('map_frame', 'odom')
         self.declare_parameter('command_frame', '')
+        self.declare_parameter('aim_mode', 'direct')
+        self.declare_parameter('target_source', 'tracker')
+        self.declare_parameter('prediction_dt', 0.0)
         self.declare_parameter('update_frequency', 30.0)
         self.declare_parameter('target_topic', '/tracker/target')
         self.declare_parameter('target_timeout', 0.2)
+        self.declare_parameter('armors_topic', '/detector/armors')
+        self.declare_parameter('armors_timeout', 0.2)
         self.declare_parameter('speed_topic', '/game_status')
         self.declare_parameter('use_live_speed', True)
         self.declare_parameter('speed_timeout', 0.5)
@@ -62,6 +67,7 @@ class BallisticSolver(Node):
         self.declare_parameter('distance_topic', '/auto_aim/distance')
         self.declare_parameter('camera_info_topic', '/camera_info')
         self.declare_parameter('camera_frame', 'camera_link')
+        self.declare_parameter('camera_axes_mode', 'optical')
 
         self.update_params()
         self.target_qos = QoSProfile(
@@ -75,6 +81,8 @@ class BallisticSolver(Node):
 
         self.target_sub = self.create_subscription(
             Target, self.target_topic, self.target_callback, self.target_qos)
+        self.armors_sub = self.create_subscription(
+            Armors, self.armors_topic, self.armors_callback, self.target_qos)
         self.speed_sub = self.create_subscription(
             GameStatus, self.speed_topic, self.game_status_callback, 10)
         self.camera_info_sub = self.create_subscription(
@@ -91,6 +99,8 @@ class BallisticSolver(Node):
         self.latest_target = None
         self.latest_target_time = None
         self.latest_target_state = None
+        self.latest_armors = None
+        self.latest_armors_time = None
         self.latest_live_speed = None
         self.latest_live_speed_time = None
         self.camera_frame = self.get_parameter('camera_frame').value
@@ -113,9 +123,14 @@ class BallisticSolver(Node):
         self.command_frame = self.get_parameter('command_frame').value
         if not self.command_frame:
             self.command_frame = self.launch_frame
+        self.aim_mode = self.get_parameter('aim_mode').value
+        self.target_source = self.get_parameter('target_source').value
+        self.prediction_dt = self.get_parameter('prediction_dt').value
         self.update_frequency = self.get_parameter('update_frequency').value
         self.target_topic = self.get_parameter('target_topic').value
         self.target_timeout = self.get_parameter('target_timeout').value
+        self.armors_topic = self.get_parameter('armors_topic').value
+        self.armors_timeout = self.get_parameter('armors_timeout').value
         self.speed_topic = self.get_parameter('speed_topic').value
         self.use_live_speed = self.get_parameter('use_live_speed').value
         self.speed_timeout = self.get_parameter('speed_timeout').value
@@ -140,6 +155,7 @@ class BallisticSolver(Node):
         configured_camera_frame = self.get_parameter('camera_frame').value
         if configured_camera_frame:
             self.camera_frame = configured_camera_frame
+        self.camera_axes_mode = self.get_parameter('camera_axes_mode').value
 
         self.dt = 1.0 / max(self.update_frequency, 1.0)
 
@@ -167,6 +183,10 @@ class BallisticSolver(Node):
         self.latest_target_time = self.get_clock().now()
         self.latest_target_state = target_state_from_msg(msg)
 
+    def armors_callback(self, msg):
+        self.latest_armors = msg
+        self.latest_armors_time = self.get_clock().now()
+
     def game_status_callback(self, msg):
         if msg.initial_speed >= self.min_live_speed:
             self.latest_live_speed = float(msg.initial_speed)
@@ -192,6 +212,14 @@ class BallisticSolver(Node):
             return False
         age = (self.get_clock().now() - self.latest_target_time).nanoseconds / 1e9
         return age <= self.target_timeout
+
+    def armors_are_fresh(self):
+        if self.latest_armors is None or self.latest_armors_time is None:
+            return False
+        if not self.latest_armors.armors:
+            return False
+        age = (self.get_clock().now() - self.latest_armors_time).nanoseconds / 1e9
+        return age <= self.armors_timeout
 
     def get_current_muzzle_speed(self):
         if not self.use_live_speed:
@@ -231,6 +259,31 @@ class BallisticSolver(Node):
         rot, _ = self.get_frame_transform(self.map_frame, self.command_frame)
         return rot
 
+    def get_frame_position(self, frame_name):
+        _, trans = self.get_frame_transform(self.map_frame, frame_name)
+        return trans
+
+    def get_detector_target_point(self):
+        if not self.armors_are_fresh():
+            return None, None
+
+        best_armor = min(
+            self.latest_armors.armors,
+            key=lambda armor: float(armor.distance_to_image_center),
+        )
+        source_frame = self.latest_armors.header.frame_id or self.camera_frame
+        rot, trans = self.get_frame_transform(self.map_frame, source_frame)
+        if rot is None:
+            return None, None
+
+        point_source = np.array([
+            float(best_armor.pose.position.x),
+            float(best_armor.pose.position.y),
+            float(best_armor.pose.position.z),
+        ], dtype=float)
+        point_world = rot @ point_source + trans
+        return point_world, best_armor
+
     def get_frame_transform(self, target_frame, source_frame):
         try:
             t = self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time())
@@ -269,8 +322,12 @@ class BallisticSolver(Node):
         if z <= 1e-6:
             return None
 
-        u = self.fx * float(point_camera[0]) / z + self.cx
-        v = self.fy * float(point_camera[1]) / z + self.cy
+        if self.camera_axes_mode == 'x_down_y_left_z_forward':
+            u = self.cx - self.fx * float(point_camera[1]) / z
+            v = self.cy + self.fy * float(point_camera[0]) / z
+        else:
+            u = self.fx * float(point_camera[0]) / z + self.cx
+            v = self.fy * float(point_camera[1]) / z + self.cy
         return u, v, z
 
     @staticmethod
@@ -287,9 +344,27 @@ class BallisticSolver(Node):
             'flight_time': 0.0,
         }
 
+    @staticmethod
+    def solve_center_lock(target_world, camera_pos, command_rot):
+        target_local = command_rot.T @ (target_world - camera_pos)
+        horizontal = float(np.linalg.norm(target_local[:2]))
+        if horizontal < 1e-6 and abs(float(target_local[2])) < 1e-6:
+            return None
+        yaw = math.atan2(float(target_local[1]), float(target_local[0]))
+        pitch = math.atan2(float(target_local[2]), horizontal)
+        return {
+            'yaw': yaw,
+            'pitch': pitch,
+            'flight_time': 0.0,
+        }
+
     def solve_once(self):
-        has_target = self.target_is_fresh()
-        is_tracking = has_target and self.latest_target is not None and bool(self.latest_target.tracking)
+        if self.target_source == 'detector':
+            has_target = self.armors_are_fresh()
+            is_tracking = has_target
+        else:
+            has_target = self.target_is_fresh()
+            is_tracking = has_target and self.latest_target is not None and bool(self.latest_target.tracking)
         auto_aim_msg = AutoAimCmd()
         auto_aim_msg.header.stamp = self.get_clock().now().to_msg()
         auto_aim_msg.header.frame_id = self.command_frame
@@ -304,7 +379,7 @@ class BallisticSolver(Node):
         self.track_pub.publish(Bool(data=is_tracking))
         self.fire_pub.publish(Bool(data=False))
 
-        if not has_target or not is_tracking or self.latest_target_state is None:
+        if not has_target or not is_tracking:
             return
 
         launch_pos, launch_rot = self.get_launch_pose()
@@ -315,12 +390,33 @@ class BallisticSolver(Node):
         if command_rot is None:
             return
 
-        current_candidates = reconstruct_armor_points(self.latest_target_state)
-        if not current_candidates:
+        camera_pos = self.get_frame_position(self.camera_frame)
+        if camera_pos is None:
             return
 
-        target_point = current_candidates[0]
-        solution = self.solve_direct_aim(target_point, launch_pos, command_rot)
+        if self.target_source == 'detector':
+            target_point, _ = self.get_detector_target_point()
+        else:
+            if self.latest_target_state is None:
+                return
+            predicted_state = self.latest_target_state
+            if self.prediction_dt > 0.0:
+                predicted_state = predict_target_state(
+                    self.latest_target_state, float(self.prediction_dt))
+            current_candidates = reconstruct_armor_points(predicted_state)
+            if not current_candidates:
+                return
+            target_point = select_target_point(current_candidates, camera_pos)
+        if target_point is None:
+            return
+
+        if self.aim_mode == 'center_lock':
+            solution = self.solve_center_lock(target_point, camera_pos, command_rot)
+        elif self.aim_mode == 'ballistic':
+            solution = self.ballistic_calculator.solve_ballistic_arc(
+                target_point, launch_pos, launch_rot)
+        else:
+            solution = self.solve_direct_aim(target_point, launch_pos, command_rot)
         if solution is None:
             return
 
@@ -350,7 +446,13 @@ class BallisticSolver(Node):
         auto_aim_msg.pitch = float(solution['pitch'])
         auto_aim_msg.yaw = float(solution['yaw'])
         auto_aim_msg.distance = target_distance
-        auto_aim_msg.fire = bool(self.auto_fire and self.latest_target.tracking)
+        auto_aim_msg.fire = bool(
+            self.auto_fire
+            and (
+                self.target_source == 'detector'
+                or (self.latest_target is not None and self.latest_target.tracking)
+            )
+        )
 
         self.distance_pub.publish(Float32(data=target_distance))
         self.fire_pub.publish(Bool(data=auto_aim_msg.fire))
